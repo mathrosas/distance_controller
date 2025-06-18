@@ -18,7 +18,8 @@ using namespace std::chrono_literals;
 
 class DistanceController : public rclcpp::Node {
 public:
-  DistanceController() : Node("distance_controller"), phi_(0.0) {
+  DistanceController(int scene_number)
+      : Node("distance_controller"), scene_number_(scene_number) {
     RCLCPP_INFO(get_logger(), "Distance controller node.");
     // pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
     //     "wheel_speed", 10);
@@ -36,6 +37,7 @@ public:
     w_ = 0.26969 / 2.0; // half wheelbase
     l_ = 0.17000 / 2.0; // half track width
     r_ = 0.10000 / 2.0; // wheel radius
+    select_waypoints();
   }
 
   void run() {
@@ -128,20 +130,16 @@ public:
   }
 
 private:
-  //   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_;
+  std::vector<std::tuple<double, double, double>> motions_;
   double x_, y_, phi_;
   double w_, l_, r_;
 
   double pos_tol = 0.1;
   double ang_tol = 0.1;
 
-  // Define the sequence of (phi, x, y) motions
-  std::vector<std::tuple<double, double, double>> motions_{
-      {0.0, 1.0, 0},   {0.0, -1.0, 0.0},  {0.0, -1.0, 0.0}, {0.0, 1.0, 0.0},
-      {1.0, 1.0, 0.0}, {-1.0, -1.0, 0.0}, {1.0, -1.0, 0.0}, {-1.0, 1.0, 0.0},
-      {1.0, 0.0, 0.0}, {-1.0, 0.0, 0.0}};
+  int scene_number_;
 
   void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
     x_ = msg->pose.pose.position.x;
@@ -233,11 +231,35 @@ private:
     pub_->publish(twist);
     RCLCPP_INFO(get_logger(), "Stop");
   }
+
+  void select_waypoints() {
+    switch (scene_number_) {
+    case 1: // Simulation
+      motions_ = {{0.0, 1.0, 0},    {0.0, -1.0, 0.0}, {0.0, -1.0, 0.0},
+                  {0.0, 1.0, 0.0},  {1.0, 1.0, 0.0},  {-1.0, -1.0, 0.0},
+                  {1.0, -1.0, 0.0}, {-1.0, 1.0, 0.0}, {1.0, 0.0, 0.0},
+                  {-1.0, 0.0, 0.0}};
+      break;
+
+    case 2: // CyberWorld
+      motions_ = {
+          {1.0, 0.0, 0}, {0.0, -0.6, 0.0}, {0.0, 0.5, 0.0}, {-1.0, 0.0, 0.0}};
+      break;
+
+    default:
+      RCLCPP_ERROR(this->get_logger(), "Invalid Scene Number: %d",
+                   scene_number_);
+    }
+  }
 };
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<DistanceController>();
+  int scene_number = 1;
+  if (argc > 1) {
+    scene_number = std::atoi(argv[1]);
+  }
+  auto node = std::make_shared<DistanceController>(scene_number);
   node->run();
   rclcpp::shutdown();
   return 0;
