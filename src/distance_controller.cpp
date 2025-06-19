@@ -21,8 +21,7 @@ public:
   DistanceController(int scene_number)
       : Node("distance_controller"), scene_number_(scene_number) {
     RCLCPP_INFO(get_logger(), "Distance controller node.");
-    // pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
-    //     "wheel_speed", 10);
+
     pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
     sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
         "/odometry/filtered", 10,
@@ -41,88 +40,66 @@ public:
   }
 
   void run() {
-    double error_phi, error_x, error_y;
-    double goal_x = 0.0, goal_y = 0.0, goal_phi = 0.0;
-    double Kp = 0.5, Ki = 0.0, Kd = 0.05;
-    double error_phi_prev, error_x_prev, error_y_prev;
-    double integral_phi = 0;
-    double integral_x = 0;
-    double integral_y = 0;
-    double derivative_phi, derivative_x, derivative_y;
-    double PID_phi, PID_x, PID_y;
-    double I_MAX = 1.0; // integrate clamp [–1,1]
-    double V_MAX = 0.5; // max linear m/s
-    double W_MAX = 1.0; // max angular rad/s
+    // PID gains
+    const double Kp = 0.5, Ki = 0.0, Kd = 0.05;
+    double integral = 0.0, prev_error = 0.0;
 
+    const double I_MAX = 1.0; // integral clamp
+    const double V_MAX = 0.8; // m/s
+
+    // wait for subscribers
     while (pub_->get_subscription_count() == 0) {
       rclcpp::sleep_for(100ms);
     }
-
     auto t0 = std::chrono::steady_clock::now();
 
-    for (auto [rel_x, rel_y, rel_phi] : motions_) {
-      goal_phi += rel_phi;
-      goal_x += rel_x;
-      goal_y += rel_y;
+    for (auto [dx_rel, dy_rel, _] : motions_) {
+      double goal_x = x_ + dx_rel;
+      double goal_y = y_ + dy_rel;
 
-      // reset previous errors/integrals for each segment if you like
-      error_x_prev = error_y_prev = error_phi_prev = 0.0;
-      integral_x = integral_y = integral_phi = 0.0;
+      integral = 0.0;
+      prev_error = 0.0;
 
-      // **2) main control loop**
-      while (std::hypot(goal_x - x_, goal_y - y_) > pos_tol ||
-             std::abs(goal_phi - phi_) > ang_tol) {
-        // ——— timing ———
+      // #### main loop: distance > tolerance
+      while (true) {
+        // compute dt
         auto t1 = std::chrono::steady_clock::now();
         double dt = std::chrono::duration<double>(t1 - t0).count();
         t0 = t1;
-        if (dt <= 0.0)
-          dt = 1e-3; // protect against zero
+        if (dt <= 0)
+          dt = 1e-3;
 
-        // ——— compute errors ———
-        error_x = goal_x - x_;
-        error_y = goal_y - y_;
-        error_phi = goal_phi - phi_;
+        // radial error
+        double ex = goal_x - x_;
+        double ey = goal_y - y_;
+        double dist = std::hypot(ex, ey);
+        if (dist <= pos_tol)
+          break;
 
-        // ——— integrate (with clamp) ———
-        integral_x = std::clamp(integral_x + error_x * dt, -I_MAX, I_MAX);
-        integral_y = std::clamp(integral_y + error_y * dt, -I_MAX, I_MAX);
-        integral_phi = std::clamp(integral_phi + error_phi * dt, -I_MAX, I_MAX);
+        // PID on distance
+        integral = std::clamp(integral + dist * dt, -I_MAX, I_MAX);
+        double derivative = (dist - prev_error) / dt;
+        double v = Kp * dist + Ki * integral + Kd * derivative;
+        v = std::clamp(v, -V_MAX, V_MAX);
+        prev_error = dist;
 
-        // ——— derivative (scaled) ———
-        derivative_x = (error_x - error_x_prev) / dt;
-        derivative_y = (error_y - error_y_prev) / dt;
-        derivative_phi = (error_phi - error_phi_prev) / dt;
+        // direction unit‐vector
+        double ux = ex / dist;
+        double uy = ey / dist;
 
-        // ——— PID law ———
-        PID_x = Kp * error_x + Ki * integral_x + Kd * derivative_x;
-        PID_y = Kp * error_y + Ki * integral_y + Kd * derivative_y;
-        PID_phi = Kp * error_phi + Ki * integral_phi + Kd * derivative_phi;
+        // body‐frame velocities
+        double vx = v * ux;
+        double vy = v * uy;
 
-        // ——— clamp commanded speeds ———
-        PID_x = std::clamp(PID_x, -V_MAX, V_MAX);
-        PID_y = std::clamp(PID_y, -V_MAX, V_MAX);
-        PID_phi = std::clamp(PID_phi, -W_MAX, W_MAX);
-
-        // ——— remember for next derivative ———
-        error_x_prev = error_x;
-        error_y_prev = error_y;
-        error_phi_prev = error_phi;
-
-        // ——— convert & publish ———
-        auto [wz, vx, vy] = velocity2twist(PID_phi, PID_x, PID_y);
-        auto wheels = twist2wheels(wz, vx, vy);
+        // holonomic drive → wheel speeds → safe Twist
+        auto wheels = twist2wheels(0.0, vx, vy);
         wheels2twist(wheels);
 
-        // spin & sleep
         rclcpp::spin_some(shared_from_this());
         rclcpp::sleep_for(25ms);
 
-        // debug
-        RCLCPP_INFO(
-            get_logger(),
-            "err=(%.2f,%.2f) φerr=%.2f → commands vx=%.2f vy=%.2f ω=%.2f",
-            error_x, error_y, error_phi, PID_x, PID_y, PID_phi);
+        RCLCPP_INFO(get_logger(), "dist=%.2f → v=%.2f (vx=%.2f, vy=%.2f)", dist,
+                    v, vx, vy);
       }
 
       stop();
@@ -133,34 +110,23 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_;
   std::vector<std::tuple<double, double, double>> motions_;
-  double x_, y_, phi_;
+  double x_, y_;
   double w_, l_, r_;
 
   double pos_tol = 0.1;
-  double ang_tol = 0.1;
 
   int scene_number_;
 
   void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
     x_ = msg->pose.pose.position.x;
     y_ = msg->pose.pose.position.y;
-
-    // Extract yaw (φ) from quaternion
-    tf2::Quaternion q(
-        msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
-        msg->pose.pose.orientation.z, msg->pose.pose.orientation.w);
-    tf2::Matrix3x3 m(q);
-    double roll, pitch, yaw;
-    m.getRPY(roll, pitch, yaw);
-    phi_ = yaw;
   }
 
   std::tuple<double, double, double>
   velocity2twist(double error_phi, double error_x, double error_y) {
-    // Build rotation matrix R(φ)
+    // Build rotation matrix R(phi)
     Eigen::Matrix3d R;
-    R << 1, 0, 0, 0, std::cos(phi_), std::sin(phi_), 0, -std::sin(phi_),
-        std::cos(phi_);
+    R << 1, 0, 0, 0, std::cos(0), std::sin(0), 0, -std::sin(0), std::cos(0);
 
     Eigen::Vector3d v(error_phi, error_x, error_y);
     Eigen::Vector3d twist = R * v;
@@ -243,7 +209,7 @@ private:
 
     case 2: // CyberWorld
       motions_ = {
-          {1.0, 0.0, 0}, {0.0, -0.6, 0.0}, {0.0, 0.5, 0.0}, {-1.0, 0.0, 0.0}};
+          {1.0, 0.0, 0}, {0.0, -0.6, 0.0}, {0.0, 0.6, 0.0}, {-1.0, 0.0, 0.0}};
       break;
 
     default:
