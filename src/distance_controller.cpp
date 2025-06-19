@@ -113,7 +113,7 @@ private:
   double x_, y_;
   double w_, l_, r_;
 
-  double pos_tol = 0.1;
+  double pos_tol = 0.05;
 
   int scene_number_;
 
