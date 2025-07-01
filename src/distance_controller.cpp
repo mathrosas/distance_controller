@@ -47,6 +47,9 @@ public:
     const double I_MAX = 1.0; // integral clamp
     const double V_MAX = 0.8; // m/s
 
+    double goal_x = x_;
+    double goal_y = y_;
+
     // wait for subscribers
     while (pub_->get_subscription_count() == 0) {
       rclcpp::sleep_for(100ms);
@@ -54,8 +57,8 @@ public:
     auto t0 = std::chrono::steady_clock::now();
 
     for (auto [dx_rel, dy_rel, _] : motions_) {
-      double goal_x = x_ + dx_rel;
-      double goal_y = y_ + dy_rel;
+      goal_x += dx_rel;
+      goal_y += dy_rel;
 
       integral = 0.0;
       prev_error = 0.0;
@@ -214,7 +217,7 @@ private:
 
     case 2: // CyberWorld
       motions_ = {
-          {1.0, 0.0, 0}, {0.0, -0.6, 0.0}, {0.0, 0.6, 0.0}, {-1.0, 0.0, 0.0}};
+          {1.0, 0.0, 0}, {0.0, -0.45, 0.0}, {0.0, 0.45, 0.0}, {-1.0, 0.0, 0.0}};
       break;
 
     default:
