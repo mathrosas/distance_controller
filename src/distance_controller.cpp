@@ -41,7 +41,7 @@ public:
 
   void run() {
     // PID gains
-    const double Kp = 0.5, Ki = 0.0, Kd = 0.05;
+    const double Kp = 0.5, Ki = 0.05, Kd = 0.1;
     double integral = 0.0, prev_error = 0.0;
 
     const double I_MAX = 1.0; // integral clamp
@@ -91,15 +91,15 @@ public:
         double vx = v * ux;
         double vy = v * uy;
 
-        // holonomic drive → wheel speeds → safe Twist
+        // holonomic drive -> wheel speeds -> safe Twist
         auto wheels = twist2wheels(0.0, vx, vy);
         wheels2twist(wheels);
 
         rclcpp::spin_some(shared_from_this());
         rclcpp::sleep_for(25ms);
 
-        RCLCPP_INFO(get_logger(), "dist=%.2f → v=%.2f (vx=%.2f, vy=%.2f)", dist,
-                    v, vx, vy);
+        RCLCPP_INFO(get_logger(), "dist=%.2f -> v=%.2f (vx=%.2f, vy=%.2f)",
+                    dist, v, vx, vy);
       }
 
       stop();
@@ -113,7 +113,7 @@ private:
   double x_, y_;
   double w_, l_, r_;
 
-  double pos_tol = 0.05;
+  double pos_tol = 0.01;
 
   int scene_number_;
 
@@ -194,8 +194,13 @@ private:
 
   void stop() {
     geometry_msgs::msg::Twist twist;
-    pub_->publish(twist);
-    RCLCPP_INFO(get_logger(), "Stop");
+    rclcpp::Rate rate(20);
+    for (int i = 0; i < 20; ++i) {
+      pub_->publish(twist);
+      rclcpp::spin_some(shared_from_this());
+      rate.sleep();
+    }
+    RCLCPP_INFO(get_logger(), "Stop (zeroed for 0.5 s)");
   }
 
   void select_waypoints() {
