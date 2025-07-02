@@ -96,7 +96,6 @@ public:
         double vx = v * ux;
         double vy = v * uy;
 
-        twist.angular.z = 0;
         twist.linear.x = vx;
         twist.linear.y = vy;
 
