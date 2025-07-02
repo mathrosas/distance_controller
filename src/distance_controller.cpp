@@ -32,10 +32,6 @@ public:
     //     std::bind(&DistanceController::odom_callback, this,
     //               std::placeholders::_1));
 
-    // Robot geometry
-    w_ = 0.26969 / 2.0; // half wheelbase
-    l_ = 0.17000 / 2.0; // half track width
-    r_ = 0.10000 / 2.0; // wheel radius
     select_waypoints();
   }
 
