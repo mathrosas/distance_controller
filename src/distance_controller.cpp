@@ -94,6 +94,7 @@ public:
 
         twist.linear.x = vx;
         twist.linear.y = vy;
+        twist.angular.z = 0.0;
 
         pub_->publish(twist);
 
@@ -145,10 +146,10 @@ private:
       break;
 
     case 2: // CyberWorld
-      motions_ = {{0.89, 0.0, 0},
-                  {0.0, -0.50, 0.0},
-                  {0.0, 0.50, 0.0},
-                  {-0.89, 0.0, 0.0}};
+      motions_ = {{0.88, 0.0, 0},
+                  {0.0, -0.60, 0.0},
+                  {0.0, 0.60, 0.0},
+                  {-0.88, 0.0, 0.0}};
       break;
 
     default:
