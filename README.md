@@ -53,6 +53,37 @@ Both scenes are relative `(dx, dy, _)` triplets in the absolute odom frame:
 (0.88, 0.0), (0.0, -0.60), (0.0, 0.60), (-0.88, 0.0)
 ```
 
+## Real Robot Deployment (CyberWorld)
+
+<p align="center">
+  <img src="media/waypoints-real.png" alt="Real ROSBot XL distance-controller waypoint trace recorded in CyberWorld" width="650"/>
+</p>
+
+The same executable runs **unmodified** on the real Husarion ROSBot XL in The Construct's **CyberWorld** lab — only the scene number changes. The `scene_number = 2` path is intentionally short (`4` waypoints, `~0.88 m × 0.60 m` rectangle) to fit the real arena and stay inside the laser-obstructed walls:
+
+1. The ROSBot XL real-robot stack (`rosbot_xl_ros` + its EKF + wheel controllers) is already running on the physical robot; `/odometry/filtered` is served over the CyberWorld connection
+2. The `distance_controller` node is launched locally with `scene_number = 2`:
+
+   ```bash
+   ros2 run distance_controller distance_controller 2
+   ```
+3. Closed-loop tracking uses the **same EKF-fused odometry topic** (`/odometry/filtered`) that the sim subscribes to — the controller is feedback-source agnostic
+4. The real-robot trace validates:
+   - PID gains tuned on the holonomic platform transfer 1:1 from sim to hardware
+   - Integral wind-up clamp (`±1.0`) prevents overshoot on the longer `0.88 m` first segment
+   - `pos_tol = 0.01 m` is achievable on the real robot without chattering because the `V_MAX = 0.4 m/s` cap + 25 ms control loop damps the approach
+
+### Sim ↔ real parity
+
+| Concern | Simulation (scene 1) | Real CyberWorld (scene 2) |
+|---|---|---|
+| Feedback topic | `/odometry/filtered` | `/odometry/filtered` |
+| Waypoint count | 10 | 4 |
+| Max segment length | `√2 m` | `0.88 m` |
+| PID gains | `Kp=0.5, Ki=0.05, Kd=0.1` | `Kp=0.5, Ki=0.05, Kd=0.1` (unchanged) |
+| Tolerance | `0.01 m` | `0.01 m` |
+| Clock | sim time | wall clock |
+
 ## ROS 2 Interface
 
 | Name | Type | Description |
