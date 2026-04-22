@@ -30,7 +30,7 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(distance_controller src/distance_controller.cpp)
-ament_target_dependencies(distance_controller rclcpp std_msgs nav_msgs tf2)
+ament_target_dependencies(distance_controller rclcpp geometry_msgs nav_msgs tf2)
 
 install(TARGETS
    distance_controller
