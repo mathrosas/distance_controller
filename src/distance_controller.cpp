@@ -1,269 +1,280 @@
-#include <Eigen/Dense>
-#include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdlib>
+#include <cstddef>
+#include <functional>
 #include <geometry_msgs/msg/twist.hpp>
+#include <memory>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <tf2/LinearMath/Quaternion.h>
-#include <tf2/impl/utils.h>
+#include <tf2/utils.h>
+#include <thread>
 #include <vector>
 
-using namespace std::chrono_literals;
-
-static inline float wrapPi(float a) {
-  return std::atan2(std::sin(a), std::cos(a));
-}
+struct Waypoint {
+  double dx;   // Delta x in meters
+  double dy;   // Delta y in meters
+  double dyaw; // Delta yaw in radians
+};
 
 class DistanceController : public rclcpp::Node {
 public:
-  DistanceController(int scene_number)
-      : Node("distance_controller"), scene_number_(scene_number),
-        got_odom_(false), wp_reached_(false), init_(true), paused_(false),
-        has_last_time_(false), target_wp_(0) {
-    twist_pub_ =
-        this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
-    odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+  DistanceController(int scene_number) : Node("distance_controller") {
+
+    // Setup Waypoints and PID gains depending on scene
+    setup_scene(scene_number);
+
+    RCLCPP_INFO(this->get_logger(),
+                "PID gains: Kp=(%.3f, %.3f), Ki=(%.3f, %.3f), Kd=(%.3f, %.3f)",
+                Kp_x_, Kp_y_, Ki_x_, Ki_y_, Kd_x_, Kd_y_);
+
+    // Create Reentrant Callback Group
+    callback_group_ =
+        this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    rclcpp::SubscriptionOptions options;
+    options.callback_group = callback_group_;
+
+    // Subscriber for Odometry Information
+    odom_subscription_ = this->create_subscription<nav_msgs::msg::Odometry>(
         "/odometry/filtered", 10,
-        std::bind(&DistanceController::odomCallback, this,
-                  std::placeholders::_1));
-    timer_ = this->create_wall_timer(
-        50ms, std::bind(&DistanceController::executeCallback, this));
+        std::bind(&DistanceController::odom_callback, this,
+                  std::placeholders::_1),
+        options);
 
-    clock_ = std::make_shared<rclcpp::Clock>(RCL_ROS_TIME);
-    SelectWaypoints();
-  }
+    // Publisher for the CMD Vel
+    cmd_vel_publisher_ =
+        this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
 
-  void stopRobot() {
-    auto stop = geometry_msgs::msg::Twist();
-    for (int i = 0; i < 5; ++i) {
-      twist_pub_->publish(stop);
-    }
+    RCLCPP_INFO(this->get_logger(), "Distance Controller Node Ready!");
   }
 
 private:
-  void SelectWaypoints() {
-    // Waypoints [dx, dy, dphi] expressed in BODY frame
-    switch (scene_number_) {
+  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_publisher_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
+  rclcpp::TimerBase::SharedPtr control_timer_;
+  rclcpp::CallbackGroup::SharedPtr callback_group_;
+
+  // State
+  double current_x_{0.0}, current_y_{0.0};
+  double current_vx_{0.0}, current_vy_{0.0};
+  double current_yaw_{0.0};
+  double segment_target_x_{0.0}, segment_target_y_{0.0};
+  bool segment_active_{false};
+  bool odom_received_{false};
+  std::vector<Waypoint> waypoints_;
+  size_t current_idx_{0};
+
+  geometry_msgs::msg::Twist twist_;
+
+  // PID
+  double Kp_x_{2.5}, Kp_y_{2.5};
+  double Ki_x_{0.005}, Ki_y_{0.005};
+  double Kd_x_{0.3}, Kd_y_{0.3};
+  double sum_I_x{0.0}, sum_I_y{0.0};
+
+  // Timing & limits
+  const double rate_hz_{40.0}; // ROSbot XL and Sim work on 20 Hz
+  const double dt_{1.0 / rate_hz_};
+  double max_speed_{0.8}; // Took from ROSBot XL Spec
+  const double linear_tolerance_{0.01};
+  const double speed_tolerance_{0.01};
+
+  const double pause_duration_sec_{1.0};
+  const int pause_ticks_goal_{
+      static_cast<int>(pause_duration_sec_ * rate_hz_)}; // sec * rateHZ
+  int pause_ticks_{0};
+  bool pausing_{false};
+
+  void setup_scene(const int scene_number) {
+    switch (scene_number) {
     case 1: // Simulation
-      waypoints_ = {
-          {0.0f, 1.0f, 0.0f},   // w1
-          {0.0f, -1.0f, 0.0f},  // w2
-          {0.0f, -1.0f, 0.0f},  // w3
-          {0.0f, 1.0f, 0.0f},   // w4
-          {1.0f, 1.0f, 0.0f},   // w5
-          {-1.0f, -1.0f, 0.0f}, // w6
-          {1.0f, -1.0f, 0.0f},  // w7
-          {-1.0f, 1.0f, 0.0f},  // w8
-          {1.0f, 0.0f, 0.0f},   // w9
-          {-1.0f, 0.0f, 0.0f}   // w10
-      };
+      waypoints_ = {{0.0, 1.0, 0.0},  {0.0, -1.0, 0.0}, {0.0, -1.0, 0.0},
+                    {0.0, 1.0, 0.0},  {1.0, 1.0, 0.0},  {-1.0, -1.0, 0.0},
+                    {1.0, -1.0, 0.0}, {-1.0, 1.0, 0.0}, {1.0, 0.0, 0.0},
+                    {-1.0, 0.0, 0.0}};
+      Kp_x_ = 2.5, Kp_y_ = 2.5;
+      Ki_x_ = 0.005, Ki_y_ = 0.005;
+      Kd_x_ = 0.3, Kd_y_ = 0.3;
+      RCLCPP_INFO(get_logger(),
+                  "Scene 1 (Sim): set sim waypoints and PID gains");
+      RCLCPP_INFO(this->get_logger(), "Set Simulation Waypoints.");
       break;
-
     case 2: // CyberWorld
-      waypoints_ = {
-          {0.90f, 0.0f, 0.0f},  // w1
-          {0.0f, -0.55f, 0.0f}, // w2
-          {0.0f, 0.55f, 0.0f},  // w3
-          {-0.90f, 0.0f, 0.0f}  // w4
-      };
+      max_speed_ = 0.45;
+      Kp_x_ = 2.0, Kp_y_ = 2.0;
+      Ki_x_ = 0.001, Ki_y_ = 0.001;
+      Kd_x_ = 0.3, Kd_y_ = 0.3;
+      waypoints_ = {{1.0, -0.0, 0.0},
+                    {0.0, -0.55, 0.0},
+                    {0.0, 0.55, 0.0},
+                    {-1.0, +0.0, 0.0}};
+      RCLCPP_INFO(get_logger(),
+                  "Scene 2 (CyberWorld): set real waypoints and PID gains");
       break;
-
     default:
       RCLCPP_ERROR(this->get_logger(), "Invalid Scene Number: %d",
-                   scene_number_);
+                   scene_number);
+      rclcpp::shutdown();
     }
   }
 
-  void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-    const auto &o = msg->pose.pose.orientation;
-    tf2::Quaternion q(o.x, o.y, o.z, o.w);
-    current_pose_(0) = msg->pose.pose.position.x;
-    current_pose_(1) = msg->pose.pose.position.y;
-    current_pose_(2) = tf2::impl::getYaw(q);
-    got_odom_ = true;
+  void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+    current_x_ = msg->pose.pose.position.x;
+    current_y_ = msg->pose.pose.position.y;
+    current_vx_ = msg->twist.twist.linear.x;
+    current_vy_ = msg->twist.twist.linear.y;
+    tf2::Quaternion q(
+        msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
+        msg->pose.pose.orientation.z, msg->pose.pose.orientation.w);
+    current_yaw_ = tf2::getYaw(q);
+
+    if (!odom_received_) {
+      odom_received_ = true;
+      RCLCPP_INFO(this->get_logger(),
+                  "First odom: x=%.3f y=%.3f. Starting control loop.",
+                  current_x_, current_y_);
+
+      // Control Loop Timer 40 Hz, normal for the PID
+      control_timer_ = this->create_wall_timer(
+          std::chrono::duration<double>(dt_),
+          std::bind(&DistanceController::control_loop, this), callback_group_);
+    }
   }
 
-  void setTargetFromCurrent() {
-    // Body-frame (dx,dy) rotated into world frame, then added to current pose.
-    const float c = std::cos(current_pose_(2));
-    const float s = std::sin(current_pose_(2));
-    const Eigen::Vector3f &w = waypoints_[target_wp_];
-    target_pose_(0) = current_pose_(0) + c * w(0) - s * w(1);
-    target_pose_(1) = current_pose_(1) + s * w(0) + c * w(1);
-    target_pose_(2) = wrapPi(current_pose_(2) + w(2));
-  }
-
-  void resetPIDState() {
-    prev_error_.setZero();
-    integral_error_.setZero();
-    d_filt_.setZero();
-    has_last_time_ = false;
-  }
-
-  void executeCallback() {
-    if (!got_odom_) {
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 2000,
-                           "Odom data not received!");
+  void control_loop() {
+    if (!interfaces_ready()) {
+      stop();
       return;
     }
 
-    const rclcpp::Time now = clock_->now();
-
-    // Paused state between waypoints
-    if (paused_) {
-      if ((now - pause_time_).seconds() >= 2.0) {
-        paused_ = false;
-        resetPIDState();
-      } else {
-        auto stop = geometry_msgs::msg::Twist();
-        twist_pub_->publish(stop);
-        return;
+    if (pausing_) {
+      stop();
+      pause_ticks_++;
+      if (pause_ticks_ >= pause_ticks_goal_) {
+        pausing_ = false;
       }
-    }
-
-    // Latch target waypoint on first cycle and when previous was reached.
-    if (wp_reached_ || init_) {
-      setTargetFromCurrent();
-      init_ = false;
-      wp_reached_ = false;
-      resetPIDState();
-      RCLCPP_INFO(this->get_logger(),
-                  "WP %zu target (world): (%.3f, %.3f, %.3f)", target_wp_ + 1,
-                  target_pose_(0), target_pose_(1), target_pose_(2));
-    }
-
-    // Time step
-    double dt = 0.05;
-    if (has_last_time_) {
-      dt = (now - last_time_).seconds();
-    }
-    dt = std::clamp(dt, 1e-3, 0.2);
-    last_time_ = now;
-    has_last_time_ = true;
-    const float dtf = static_cast<float>(dt);
-
-    // World-frame translational error
-    Eigen::Vector2f err_world{target_pose_(0) - current_pose_(0),
-                              target_pose_(1) - current_pose_(1)};
-
-    // Rotate world error into BODY frame so the PID lives in the same frame
-    // as cmd_vel (body). This keeps saturation bounds physical.
-    const float c = std::cos(current_pose_(2));
-    const float s = std::sin(current_pose_(2));
-    Eigen::Vector2f err_body{c * err_world(0) + s * err_world(1),
-                             -s * err_world(0) + c * err_world(1)};
-
-    // Acceptance: position only. This controller does not command yaw, so
-    // gating on yaw would permanently block acceptance if odom yaw drifts.
-    const float dpos = err_body.norm();
-    if (dpos < pos_tol_) {
-      auto stop = geometry_msgs::msg::Twist();
-      twist_pub_->publish(stop);
-      wp_reached_ = true;
-      target_wp_++;
-
-      if (target_wp_ >= waypoints_.size()) {
-        RCLCPP_INFO(this->get_logger(), "Final waypoint reached!");
-        stopRobot();
-        rclcpp::shutdown();
-        return;
-      }
-      pause_time_ = now;
-      paused_ = true;
-      RCLCPP_INFO(this->get_logger(),
-                  "Waypoint %zu reached (dpos=%.3f m), pausing...", target_wp_,
-                  dpos);
       return;
     }
 
-    // Filtered derivative (body frame)
-    const Eigen::Vector2f prev_body{prev_error_(0), prev_error_(1)};
-    const Eigen::Vector2f d_raw = (err_body - prev_body) / dtf;
-    const Eigen::Vector2f d_f{
-        alpha_d_ * d_raw(0) + (1.0f - alpha_d_) * d_filt_(0),
-        alpha_d_ * d_raw(1) + (1.0f - alpha_d_) * d_filt_(1)};
-    d_filt_(0) = d_f(0);
-    d_filt_(1) = d_f(1);
+    // 1. If no active segment, start one (if waypoints left)
+    if (!segment_active_ && current_idx_ < waypoints_.size()) {
+      auto wp = waypoints_[current_idx_];
 
-    // PID (body frame)
-    const Eigen::Vector2f I{integral_error_(0), integral_error_(1)};
-    Eigen::Vector2f V_unsat = Kp_ * err_body + Kd_ * d_f + Ki_ * I;
+      // Translation in robot frame
+      double dx_world =
+          wp.dx * std::cos(current_yaw_) - wp.dy * std::sin(current_yaw_);
+      double dy_world =
+          wp.dx * std::sin(current_yaw_) + wp.dy * std::cos(current_yaw_);
 
-    // Saturate in body frame (per-axis, matches wheel/actuator limits)
-    Eigen::Vector2f V_sat{std::clamp(V_unsat(0), -max_lin_vel_, max_lin_vel_),
-                          std::clamp(V_unsat(1), -max_lin_vel_, max_lin_vel_)};
+      segment_target_x_ = current_x_ + dx_world;
+      segment_target_y_ = current_y_ + dy_world;
+      segment_active_ = true;
+      sum_I_x = 0.0;
+      sum_I_y = 0.0;
 
-    // Conditional-integration anti-windup (body frame)
-    auto sameSign = [](float a, float b) {
-      return (a > 0 && b > 0) || (a < 0 && b < 0);
-    };
-    const bool x_sat = (std::abs(V_unsat(0)) > std::abs(V_sat(0)) + 1e-4f) &&
-                       sameSign(V_unsat(0), err_body(0));
-    const bool y_sat = (std::abs(V_unsat(1)) > std::abs(V_sat(1)) + 1e-4f) &&
-                       sameSign(V_unsat(1), err_body(1));
-    if (!x_sat)
-      integral_error_(0) += err_body(0) * dtf;
-    if (!y_sat)
-      integral_error_(1) += err_body(1) * dtf;
-    integral_error_(0) =
-        std::clamp(integral_error_(0), -int_limit_, int_limit_);
-    integral_error_(1) =
-        std::clamp(integral_error_(1), -int_limit_, int_limit_);
-    integral_error_(2) = 0.0f;
+      RCLCPP_INFO(this->get_logger(),
+                  "Moving to waypoint %zu (dx=%.3f, dy=%.3f)", current_idx_,
+                  wp.dx, wp.dy);
+    }
 
-    prev_error_(0) = err_body(0);
-    prev_error_(1) = err_body(1);
-    prev_error_(2) = 0.0f;
+    // 2. If no more segments, stop the robot
+    if (current_idx_ >= waypoints_.size()) {
+      stop();
+      RCLCPP_INFO(this->get_logger(), "Trajectory completed.");
+      rclcpp::shutdown();
+      return;
+    }
 
-    geometry_msgs::msg::Twist cmd_vel;
-    cmd_vel.linear.x = V_sat(0);
-    cmd_vel.linear.y = V_sat(1);
-    cmd_vel.angular.z = 0.0;
-    twist_pub_->publish(cmd_vel);
+    // 3. Compute error to current waypoint
+    double ex = segment_target_x_ - current_x_;
+    double ey = segment_target_y_ - current_y_;
+    // rotate in the base frame
+    double ex_b = std::cos(current_yaw_) * ex + std::sin(current_yaw_) * ey;
+    double ey_b = -std::sin(current_yaw_) * ex + std::cos(current_yaw_) * ey;
+    double dex = 0.0 - current_vx_;
+    double dey = 0.0 - current_vy_;
+
+    // 4. Check if we reached the waypoint
+    if (std::hypot(ex_b, ey_b) < linear_tolerance_ &&
+        std::hypot(dex, dey) < speed_tolerance_) {
+      RCLCPP_INFO(this->get_logger(), "Reached waypoint %zu.", current_idx_);
+      current_idx_++;
+      segment_active_ = false;
+      stop();
+      // start pause
+      pausing_ = true;
+      pause_ticks_ = 0;
+      return;
+    }
+
+    // 5. Run our PID controller using ex, ey, dex, dey
+    compute_PID(ex_b, ey_b, dex, dey);
+
+    // RCLCPP_INFO(this->get_logger(), //*this->get_clock(), 100,
+    //             "Debug: Error (ex=%.3f, ey=%.3f) | "
+    //             "World Frame Speed: (v_x=%.3f, v_y=%.3f)",
+    //             ex, ey, current_vx_, current_vy_);
+
+    cmd_vel_publisher_->publish(twist_);
   }
 
-  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-  rclcpp::TimerBase::SharedPtr timer_;
-  rclcpp::Time pause_time_;
-  rclcpp::Time last_time_;
-  int scene_number_;
-  bool got_odom_, wp_reached_, init_, paused_, has_last_time_;
-  size_t target_wp_;
-  std::shared_ptr<rclcpp::Clock> clock_;
-  Eigen::Vector3f current_pose_{0.0f, 0.0f, 0.0f};
-  Eigen::Vector3f target_pose_{0.0f, 0.0f, 0.0f};
-  Eigen::Vector3f prev_error_{0.0f, 0.0f, 0.0f};
-  Eigen::Vector3f integral_error_{0.0f, 0.0f, 0.0f};
-  Eigen::Vector3f d_filt_{0.0f, 0.0f, 0.0f};
-  std::vector<Eigen::Vector3f> waypoints_;
+  bool interfaces_ready() {
+    // Is anyone listening to /cmd_vel ?
+    auto cmd_vel_subs = cmd_vel_publisher_->get_subscription_count();
 
-  // PID gains and limits
-  const float Kp_ = 1.0f;
-  const float Ki_ = 0.05f;
-  const float Kd_ = 0.08f;
-  const float int_limit_ = 0.6f;
-  const float alpha_d_ = 0.2f;
-  const float max_lin_vel_ = 0.28f;
+    if (cmd_vel_subs == 0) {
+      sum_I_x = 0.0;
+      sum_I_y = 0.0;
+      RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 1000,
+          "No subscribers on /cmd_vel. Holding control loop...");
+      return false;
+    }
 
-  // Acceptance tolerance (position-only; yaw is not commanded)
-  const float pos_tol_ = 0.03f;
+    return true;
+  }
+
+  void compute_PID(double ex, double ey, double dex, double dey) {
+    // Update integral value of integral control
+    sum_I_x += ex * dt_;
+    sum_I_y += ey * dt_;
+
+    twist_.linear.x = Kp_x_ * ex + Kd_x_ * dex + Ki_x_ * sum_I_x;
+    twist_.linear.y = Kp_y_ * ey + Kd_y_ * dey + Ki_y_ * sum_I_y;
+
+    // Limit total linear speed to max_speed_
+    double vnorm = std::hypot(twist_.linear.x, twist_.linear.y);
+    if (vnorm > max_speed_) {
+      twist_.linear.x *= max_speed_ / vnorm;
+      twist_.linear.y *= max_speed_ / vnorm;
+    }
+  }
+
+  void stop() {
+    twist_.linear.x = 0.0;
+    twist_.linear.y = 0.0;
+    cmd_vel_publisher_->publish(twist_);
+  }
 };
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
 
-  int scene_number = 2; // default: real
+  // Check if a scene number argument is provided
+  int scene_number = 1; // Default scene number to simulation
   if (argc > 1) {
     scene_number = std::atoi(argv[1]);
   }
 
   auto node = std::make_shared<DistanceController>(scene_number);
-  rclcpp::spin(node);
-
-  node->stopRobot();
+  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(),
+                                                    2);
+  executor.add_node(node);
+  try {
+    executor.spin();
+  } catch (const std::exception &e) {
+    RCLCPP_ERROR(node->get_logger(), "Exception: %s", e.what());
+  }
   rclcpp::shutdown();
   return 0;
 }
