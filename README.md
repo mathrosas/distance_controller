@@ -1,6 +1,6 @@
 # Checkpoint 17 — Distance Controller
 
-ROS 2 C++ **PID position controller** for the **Husarion ROSBot XL** (4-wheel mecanum / holonomic). The node drives the robot through a chain of relative `(dx, dy)` waypoints by closing the loop on the **Euclidean distance** to each goal and projecting the PID output along the unit direction vector to produce body-frame `v_x` / `v_y`. Subscribes to the EKF-fused odometry, publishes `geometry_msgs/Twist` on `/cmd_vel`, and works against both the Gazebo simulation and the real CyberWorld ROSBot XL — the waypoint list is selected from a **scene number** passed as a CLI argument.
+ROS 2 C++ **PID position controller** for the **Husarion ROSBot XL** (4-wheel mecanum / holonomic). The node drives the robot through a chain of relative `(dx, dy)` waypoints **expressed in the body frame** by running two independent PID loops on the body-frame position errors `ex_b`, `ey_b`. It subscribes to the EKF-fused odometry, publishes `geometry_msgs/Twist` on `/cmd_vel`, and works against both the Gazebo simulation and the real CyberWorld ROSBot XL — the waypoint list **and** the PID gain set are selected from a **scene number** passed as a CLI argument.
 
 <p align="center">
   <img src="media/waypoints-sim.png" alt="ROSBot XL distance-controller waypoint trace in simulation" width="650"/>
@@ -14,30 +14,41 @@ ROS 2 C++ **PID position controller** for the **Husarion ROSBot XL** (4-wheel me
 
 ### Control Loop
 
-1. A single-node executable `distance_controller` subscribes to `/odometry/filtered` (`nav_msgs/Odometry`) and publishes `geometry_msgs/Twist` on `/cmd_vel`
-2. On construction it calls `select_waypoints(scene_number)` — `1` loads the sim waypoint list, `2` loads the CyberWorld list
-3. `run()` blocks until a subscriber is connected, then iterates over the `[dx, dy, _]` motion list, accumulating each `(dx, dy)` into absolute goals `(goal_x, goal_y)`
-4. Per iteration (`25 ms` loop, timed with `std::chrono::steady_clock`):
-   - Radial error `e = (goal_x - x, goal_y - y)`, scalar `dist = hypot(e)`
-   - PID on `dist`: `v = Kp·dist + Ki·∫dist·dt + Kd·Δdist/dt`
-   - Clamps: integral wind-up `±1.0`, linear command `±0.4 m/s`
-   - Unit direction `(ux, uy) = e / dist`, body-frame command `(v_x, v_y) = v · (ux, uy)`, `ω_z = 0`
-5. Exits the per-waypoint loop when `dist ≤ 0.01 m`; emits a 0.5 s zero-twist burst (`stop()`) between segments before moving to the next
+1. A single-node executable `distance_controller` subscribes to `/odometry/filtered` (`nav_msgs/Odometry`) and publishes `geometry_msgs/Twist` on `/cmd_vel`. Odometry and timer callbacks share a **Reentrant callback group** so they can run concurrently on a `MultiThreadedExecutor`.
+2. On construction, `setup_scene(scene_number)` selects the waypoint list **and** the PID gains — `1` for Gazebo, `2` for CyberWorld
+3. The first odom message latches the initial pose and spawns a **40 Hz wall-timer** (`dt = 25 ms`) that runs the control loop
+4. When a new segment starts, the relative body-frame displacement `(wp.dx, wp.dy)` is rotated by the **current yaw** to build an absolute world-frame target `(segment_target_x, segment_target_y)`:
+   - `dx_world =  dx·cos(φ) − dy·sin(φ)`
+   - `dy_world =  dx·sin(φ) + dy·cos(φ)`
+5. Per tick:
+   - World-frame error `(ex, ey) = (target − current)`
+   - Rotated back into the **body frame**: `ex_b =  cos(φ)·ex + sin(φ)·ey`, `ey_b = −sin(φ)·ex + cos(φ)·ey`
+   - Velocity error uses the odometry twist directly: `dex = 0 − v_x`, `dey = 0 − v_y`
+   - Two independent PIDs compute `(linear.x, linear.y)` in body frame; `angular.z = 0`
+   - The `(linear.x, linear.y)` vector is renormalised so `‖v‖ ≤ max_speed_`
+6. A waypoint is considered reached when **both** `‖(ex_b, ey_b)‖ < 0.01 m` **and** `‖(v_x, v_y)‖ < 0.01 m/s`. The node then zeroes the twist, pauses `1.0 s`, resets integral accumulators and moves to the next waypoint
+7. `/cmd_vel` is held at zero while no subscribers are connected, and integral accumulators are reset so the controller doesn't wind up while waiting for the driver
 
 ### PID Configuration
 
-| Gain | Value |
-|------|-------|
-| `Kp` | `0.5`  |
-| `Ki` | `0.05` |
-| `Kd` | `0.1`  |
-| Integral clamp `I_MAX` | `1.0`  |
-| Max linear speed `V_MAX` | `0.4 m/s` |
-| Position tolerance `pos_tol` | `0.01 m` |
+Gains are per-axis (independent on `x` and `y`) and differ between sim and CyberWorld:
+
+| Parameter | Scene 1 (Simulation) | Scene 2 (CyberWorld) |
+|---|---|---|
+| `Kp_x`, `Kp_y` | `2.5` | `2.0` |
+| `Ki_x`, `Ki_y` | `0.005` | `0.001` |
+| `Kd_x`, `Kd_y` | `0.3` | `0.3` |
+| Max linear speed `max_speed_` | `0.8 m/s` | `0.45 m/s` |
+| Position tolerance | `0.01 m` | `0.01 m` |
+| Velocity tolerance | `0.01 m/s` | `0.01 m/s` |
+| Control rate | `40 Hz` (`dt = 25 ms`) | `40 Hz` |
+| Inter-waypoint pause | `1.0 s` | `1.0 s` |
+
+The derivative term uses the **measured body-frame velocity** from the odometry twist rather than the discrete error delta — this gives a cleaner D-term and lets the position P and velocity D loops share a single PID structure.
 
 ## Waypoint Scenes
 
-Both scenes are relative `(dx, dy, _)` triplets in the absolute odom frame:
+All waypoints are relative `(dx, dy, dyaw)` triplets **in the body frame** — the third element is unused by this node and always `0.0`.
 
 ### Scene 1 — Simulation (`scene_number = 1`, 10 waypoints)
 
@@ -50,8 +61,10 @@ Both scenes are relative `(dx, dy, _)` triplets in the absolute odom frame:
 ### Scene 2 — CyberWorld (`scene_number = 2`, 4 waypoints)
 
 ```
-(0.88, 0.0), (0.0, -0.60), (0.0, 0.60), (-0.88, 0.0)
+(1.0, 0.0), (0.0, -0.55), (0.0, 0.55), (-1.0, 0.0)
 ```
+
+Net displacement in both scenes is `(0, 0)` — the robot returns to its starting pose, which makes a closed-loop odometry-drift check trivial.
 
 ## Real Robot Deployment (CyberWorld)
 
@@ -59,7 +72,7 @@ Both scenes are relative `(dx, dy, _)` triplets in the absolute odom frame:
   <img src="media/waypoints-real.png" alt="Real ROSBot XL distance-controller waypoint trace recorded in CyberWorld" width="650"/>
 </p>
 
-The same executable runs **unmodified** on the real Husarion ROSBot XL in The Construct's **CyberWorld** lab — only the scene number changes. The `scene_number = 2` path is intentionally short (`4` waypoints, `~0.88 m × 0.60 m` rectangle) to fit the real arena and stay inside the laser-obstructed walls:
+The same executable runs **unmodified** on the real Husarion ROSBot XL in The Construct's **CyberWorld** lab — only the scene number changes. Scene `2` tightens the gains, caps the speed, and swaps the waypoint list for a `1.0 m × 0.55 m` rectangle that fits the physical arena:
 
 1. The ROSBot XL real-robot stack (`rosbot_xl_ros` + its EKF + wheel controllers) is already running on the physical robot; `/odometry/filtered` is served over the CyberWorld connection
 2. The `distance_controller` node is launched locally with `scene_number = 2`:
@@ -68,10 +81,10 @@ The same executable runs **unmodified** on the real Husarion ROSBot XL in The Co
    ros2 run distance_controller distance_controller 2
    ```
 3. Closed-loop tracking uses the **same EKF-fused odometry topic** (`/odometry/filtered`) that the sim subscribes to — the controller is feedback-source agnostic
-4. The real-robot trace validates:
-   - PID gains tuned on the holonomic platform transfer 1:1 from sim to hardware
-   - Integral wind-up clamp (`±1.0`) prevents overshoot on the longer `0.88 m` first segment
-   - `pos_tol = 0.01 m` is achievable on the real robot without chattering because the `V_MAX = 0.4 m/s` cap + 25 ms control loop damps the approach
+4. Scene-specific tuning for the real robot:
+   - Lower `Kp` (`2.0` vs `2.5`) and lower `Ki` (`0.001` vs `0.005`) damp mecanum-wheel slip
+   - `max_speed_ = 0.45 m/s` keeps the robot well under the `0.8 m/s` platform limit and avoids overshoot on the `1.0 m` first segment
+   - Same `0.01 m` position tolerance and `0.01 m/s` velocity tolerance as sim — the combined gate prevents declaring a waypoint reached while the robot is still coasting
 
 ### Sim ↔ real parity
 
@@ -79,17 +92,18 @@ The same executable runs **unmodified** on the real Husarion ROSBot XL in The Co
 |---|---|---|
 | Feedback topic | `/odometry/filtered` | `/odometry/filtered` |
 | Waypoint count | 10 | 4 |
-| Max segment length | `√2 m` | `0.88 m` |
-| PID gains | `Kp=0.5, Ki=0.05, Kd=0.1` | `Kp=0.5, Ki=0.05, Kd=0.1` (unchanged) |
-| Tolerance | `0.01 m` | `0.01 m` |
+| Max segment length | `√2 m` | `1.0 m` |
+| PID gains | `Kp=2.5, Ki=0.005, Kd=0.3` | `Kp=2.0, Ki=0.001, Kd=0.3` |
+| Max linear speed | `0.8 m/s` | `0.45 m/s` |
+| Position tolerance | `0.01 m` | `0.01 m` |
+| Velocity tolerance | `0.01 m/s` | `0.01 m/s` |
 | Clock | sim time | wall clock |
 
 ## ROS 2 Interface
 
 | Name | Type | Description |
 |---|---|---|
-| `/odometry/filtered` | `nav_msgs/Odometry` (sub) | EKF-fused odometry consumed as feedback |
-| `/rosbot_xl_base_controller/odom` | `nav_msgs/Odometry` | Raw wheel odometry (alternate, commented in source) |
+| `/odometry/filtered` | `nav_msgs/Odometry` (sub) | EKF-fused odometry — pose (`x`, `y`, yaw) and twist (`v_x`, `v_y`) |
 | `/cmd_vel` | `geometry_msgs/Twist` (pub) | Body-frame command (`linear.x`, `linear.y`, `angular.z = 0`) |
 
 ## Project Structure
@@ -110,7 +124,7 @@ distance_controller/
 
 - ROS 2 Humble
 - Gazebo (bundled with the `rosbot_xl_gazebo` simulation)
-- `eigen3`, `tf2`, `nav_msgs`, `geometry_msgs`
+- `tf2`, `nav_msgs`, `geometry_msgs`
 - `rosbot_xl_ros` stack in the same workspace (description + controllers + EKF)
 
 ### Build
@@ -131,6 +145,8 @@ ros2 launch rosbot_xl_gazebo simulation.launch.py
 ros2 run distance_controller distance_controller 1
 ```
 
+The scene argument is optional — omitting it defaults to scene `1` (simulation).
+
 ### Real robot (CyberWorld)
 
 ```bash
@@ -146,15 +162,15 @@ ros2 topic echo /odometry/filtered
 
 ## Key Concepts Covered
 
-- **PID on scalar distance**: integral wind-up clamp, derivative from sample-to-sample delta
-- **Vector projection**: scalar PID output split into `(v_x, v_y)` via the unit vector toward the goal (holonomic platform — no yaw correction needed)
-- **Real-time timing**: `std::chrono::steady_clock` for `dt`, 25 ms control period
-- **Scene switching via CLI**: same executable drives sim and real robot by selecting a waypoint table
-- **Feedback source**: EKF-fused odometry (`robot_localization`) vs. raw `rosbot_xl_base_controller/odom`
+- **Per-axis PID in the body frame**: two independent loops on `ex_b`, `ey_b` — simpler than the scalar-distance + projection formulation, and maps naturally to holonomic command channels
+- **Body-frame waypoints**: displacements are evaluated in the robot's body frame at segment start, then converted to absolute world-frame targets via the current yaw
+- **Velocity-feedback D-term**: derivative uses the measured twist (`v_x`, `v_y`) rather than a discrete error difference — cleaner and noise-tolerant
+- **Position + velocity arrival gate**: both `‖error‖` and `‖velocity‖` must drop below their tolerances before advancing, avoiding premature declaration at turnaround points
+- **Multi-threaded executor**: Reentrant callback group lets odom callbacks and the timer interleave without blocking
+- **Scene-specific tuning**: gain set, speed cap and waypoint list all switch on a single CLI argument
 
 ## Technologies
 
 - ROS 2 Humble
 - C++ 17 (`rclcpp`, `nav_msgs`, `geometry_msgs`, `tf2`)
-- Eigen 3
 - Husarion ROSBot XL (4-wheel mecanum) in Gazebo Sim + CyberWorld
